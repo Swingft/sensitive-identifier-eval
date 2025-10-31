@@ -26,14 +26,14 @@ class SensitiveIdentifierDetector:
     def __init__(self,
                  base_model_path: str,
                  lora_path: str,
-                 n_ctx: int = 12288,
+                 n_ctx: int = 32768,  # 12288 → 32768 (H200 충분)
                  n_gpu_layers: int = -1,
                  checkpoint_file: str = "checkpoint/processed.jsonl"):
         """
         Args:
             base_model_path: 베이스 모델 경로
             lora_path: LoRA 어댑터 경로
-            n_ctx: 컨텍스트 크기 (학습 시 12288)
+            n_ctx: 컨텍스트 크기 (기본 32768, Phi-3-mini-128k 지원)
             n_gpu_layers: GPU 레이어 수 (-1 = 전체)
             checkpoint_file: 처리 완료된 파일 기록
         """
@@ -71,7 +71,7 @@ class SensitiveIdentifierDetector:
 
     def _load_checkpoint(self) -> Dict[str, Dict]:
         """체크포인트 로드
-        
+
         Returns:
             Dict[hash, result]: 해시를 키로, 결과를 값으로
         """
@@ -109,7 +109,7 @@ class SensitiveIdentifierDetector:
 
     def _should_process(self, instruction: str, input_text: str) -> tuple:
         """처리 여부 확인
-        
+
         Returns:
             (should_process: bool, cached_result: Dict or None)
         """
@@ -122,7 +122,7 @@ class SensitiveIdentifierDetector:
 
     def _format_prompt(self, instruction: str, input_text: str) -> str:
         """학습 시 사용한 Alpaca 형식으로 프롬프트 생성
-        
+
         형식: ### Instruction:\n{inst}\n\n### Input:\n{inp}\n\n### Response:\n
         """
         inst = instruction.strip()
@@ -137,11 +137,11 @@ class SensitiveIdentifierDetector:
 
     def detect_sensitive_identifiers(self, item: Dict[str, Any], metadata: Dict[str, str]) -> Dict[str, List[str]]:
         """단일 항목에서 민감 식별자 탐지
-        
+
         Args:
             item: {"instruction": "...", "input": "..."}
             metadata: {"source_file": "...", "file_path": "..."}
-            
+
         Returns:
             {
                 "source_file": "...",
@@ -165,7 +165,7 @@ class SensitiveIdentifierDetector:
         try:
             response = self.model.create_completion(
                 prompt=prompt,
-                max_tokens=8192,
+                max_tokens=20480,  # 16384 → 20480 (n_ctx=32768이면 충분)
                 temperature=0.1,
                 top_p=0.95,
                 stop=["<|endoftext|>", "###"],
@@ -174,6 +174,11 @@ class SensitiveIdentifierDetector:
 
             output = response['choices'][0]['text'].strip()
 
+            # 출력이 잘렸는지 확인
+            finish_reason = response['choices'][0].get('finish_reason', '')
+            if finish_reason == 'length':
+                print(f"  ⚠️ 출력이 max_tokens에 의해 잘림 (토큰 부족)")
+
             # JSON 파싱 (sensitive_identifiers + reasoning 추출)
             parsed_output = self._parse_output(output)
 
@@ -181,7 +186,7 @@ class SensitiveIdentifierDetector:
             result = {
                 "source_file": metadata.get("source_file", "unknown"),
                 "sensitive_identifiers": parsed_output.get("sensitive_identifiers", {}),
-                "raw_output": output[:500]  # 디버깅용
+                "raw_output": output  # 전체 저장 (확인용)
             }
 
             # 체크포인트 저장
@@ -200,7 +205,7 @@ class SensitiveIdentifierDetector:
 
     def _parse_output(self, output: str) -> Dict:
         """모델 출력에서 sensitive_identifiers 추출
-        
+
         예상 형식:
         {
           "sensitive_identifiers": {
@@ -215,31 +220,51 @@ class SensitiveIdentifierDetector:
         """
         import re
 
-        # JSON 블록 추출
+        # JSON 블록 추출 시도
         try:
-            # 중괄호로 감싼 JSON 찾기
-            start_idx = output.find('{')
-            end_idx = output.rfind('}')
+            # 방법 1: 가장 큰 완전한 JSON 객체 찾기
+            json_candidates = []
+            depth = 0
+            start_idx = -1
 
-            if start_idx != -1 and end_idx != -1:
-                json_str = output[start_idx:end_idx + 1]
+            for i, char in enumerate(output):
+                if char == '{':
+                    if depth == 0:
+                        start_idx = i
+                    depth += 1
+                elif char == '}':
+                    depth -= 1
+                    if depth == 0 and start_idx != -1:
+                        # 완전한 JSON 객체 발견
+                        json_candidates.append(output[start_idx:i + 1])
+                        start_idx = -1
 
-                # 주석 제거
-                json_str = re.sub(r'/\*.*?\*/', '', json_str, flags=re.DOTALL)
-                json_str = re.sub(r'//.*?$', '', json_str, flags=re.MULTILINE)
+            # 가장 긴 JSON 시도 (보통 가장 완전함)
+            json_candidates.sort(key=len, reverse=True)
 
-                data = json.loads(json_str)
-                
-                # sensitive_identifiers 키가 있으면 반환
-                if 'sensitive_identifiers' in data:
-                    return {"sensitive_identifiers": data['sensitive_identifiers']}
+            for json_str in json_candidates:
+                try:
+                    # 주석 제거
+                    json_str = re.sub(r'/\*.*?\*/', '', json_str, flags=re.DOTALL)
+                    json_str = re.sub(r'//.*?$', '', json_str, flags=re.MULTILINE)
 
-        except json.JSONDecodeError as e:
-            print(f"  ⚠️ JSON 파싱 실패: {e}")
+                    data = json.loads(json_str)
+
+                    # sensitive_identifiers 키가 있으면 반환
+                    if 'sensitive_identifiers' in data:
+                        num_ids = len(data['sensitive_identifiers'])
+                        if num_ids > 0:
+                            print(f"  ✅ {num_ids}개 식별자 파싱 성공")
+                        return {"sensitive_identifiers": data['sensitive_identifiers']}
+
+                except json.JSONDecodeError:
+                    continue  # 다음 후보 시도
+
         except Exception as e:
             print(f"  ⚠️ 파싱 에러: {e}")
 
         # 파싱 실패 시 빈 결과
+        print(f"  ⚠️ JSON 파싱 실패 - 출력 미리보기: {output[:200]}...")
         return {"sensitive_identifiers": {}}
 
     def process_dataset(self,
@@ -247,7 +272,7 @@ class SensitiveIdentifierDetector:
                         output_dir: str = "output",
                         max_input_tokens: int = 10500) -> Dict[str, Any]:
         """전체 데이터셋 처리
-        
+
         Args:
             dataset_path: 입력 JSONL 파일
             output_dir: 출력 디렉토리
@@ -259,7 +284,7 @@ class SensitiveIdentifierDetector:
 
         # 출력 디렉토리 생성
         os.makedirs(output_dir, exist_ok=True)
-        
+
         # 출력 파일 경로
         per_file_output = os.path.join(output_dir, "per_file_results.jsonl")
         all_identifiers_output = os.path.join(output_dir, "all_identifiers.json")
@@ -337,7 +362,7 @@ class SensitiveIdentifierDetector:
 
                 # metadata 추출
                 metadata = item.get('metadata', {})
-                
+
                 # 민감 식별자 탐지
                 result = self.detect_sensitive_identifiers(item, metadata)
                 per_file_results.append(result)
@@ -366,22 +391,22 @@ class SensitiveIdentifierDetector:
 
                 # 실시간 저장 (10개마다)
                 if processed_count % 10 == 0:
-                    self._save_results(per_file_results, all_sensitive_identifiers, 
-                                      per_file_output, all_identifiers_output)
+                    self._save_results(per_file_results, all_sensitive_identifiers,
+                                       per_file_output, all_identifiers_output)
 
         # 최종 저장
         self._save_results(per_file_results, all_sensitive_identifiers,
-                          per_file_output, all_identifiers_output)
+                           per_file_output, all_identifiers_output)
 
         total_time = time.time() - start_time
         time_str = self._format_time(total_time)
 
         # 통계 계산
         total_identifiers_count = sum(
-            len(r.get("sensitive_identifiers", {})) 
+            len(r.get("sensitive_identifiers", {}))
             for r in per_file_results
         )
-        
+
         summary = {
             "total_files": total_items,
             "processed_files": len(per_file_results),
@@ -415,10 +440,10 @@ class SensitiveIdentifierDetector:
 
         return summary
 
-    def _save_results(self, per_file_results: List[Dict], 
-                     all_identifiers: Dict[str, int],
-                     per_file_output: str,
-                     all_identifiers_output: str):
+    def _save_results(self, per_file_results: List[Dict],
+                      all_identifiers: Dict[str, int],
+                      per_file_output: str,
+                      all_identifiers_output: str):
         """결과 저장"""
         # 파일별 결과
         with open(per_file_output, 'w', encoding='utf-8') as f:
@@ -429,7 +454,7 @@ class SensitiveIdentifierDetector:
         sorted_identifiers = dict(
             sorted(all_identifiers.items(), key=lambda x: x[1], reverse=True)
         )
-        
+
         with open(all_identifiers_output, 'w', encoding='utf-8') as f:
             json.dump({
                 "sensitive_identifiers": sorted_identifiers,
@@ -453,11 +478,11 @@ class SensitiveIdentifierDetector:
     def _load_existing_results(self, output_dir: str) -> Dict[str, Any]:
         """기존 결과 로드"""
         summary_file = os.path.join(output_dir, "summary.json")
-        
+
         if os.path.exists(summary_file):
             with open(summary_file, 'r', encoding='utf-8') as f:
                 return json.load(f)
-        
+
         return {}
 
 
@@ -491,8 +516,8 @@ def main():
     parser.add_argument(
         '--ctx',
         type=int,
-        default=12288,
-        help='컨텍스트 크기 (기본값: 12288, 학습 시 사용)'
+        default=32768,  # 12288 → 32768
+        help='컨텍스트 크기 (기본값: 32768, Phi-3-mini-128k 최대 128k 지원)'
     )
     parser.add_argument(
         '--gpu_layers',
